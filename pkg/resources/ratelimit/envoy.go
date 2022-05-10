@@ -13,8 +13,8 @@ import (
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-
 	k8sclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 const (
@@ -43,7 +43,7 @@ func NewEnvoyProxyServer(ctx context.Context, client k8sclient.Client, logger l.
 	}
 }
 
-func (envoyProxy *envoyProxyServer) CreateEnvoyProxyContainer(dcName, namespace, envoyNodeID, svcProxyName, svcProxyPortName string, svcProxyPort int) (integreatlyv1alpha1.StatusPhase, error) {
+func (envoyProxy *envoyProxyServer) CreateEnvoyProxyContainer(dcName, namespace, envoyNodeID, svcProxyName, svcProxyPortName string, svcProxyPort int, serverClient k8sclient.Client) (integreatlyv1alpha1.StatusPhase, error) {
 
 	envoyProxy.log.Infof(
 		"Creating envoy sidecar container for: ",
@@ -51,7 +51,7 @@ func (envoyProxy *envoyProxyServer) CreateEnvoyProxyContainer(dcName, namespace,
 	)
 
 	// patches deployment config to add the sidecar container
-	phase, err := envoyProxy.patchDeploymentConfig(dcName, namespace, envoyNodeID, svcProxyPort)
+	phase, err := envoyProxy.patchDeploymentConfig(dcName, namespace, envoyNodeID, svcProxyPort, serverClient)
 	if err != nil {
 		return integreatlyv1alpha1.PhaseFailed, err
 	}
@@ -65,7 +65,7 @@ func (envoyProxy *envoyProxyServer) CreateEnvoyProxyContainer(dcName, namespace,
 	return phase, nil
 }
 
-func (envoyProxy *envoyProxyServer) patchDeploymentConfig(dcName, namespace, envoyNodeID string, svcProxyPort int) (integreatlyv1alpha1.StatusPhase, error) {
+func (envoyProxy *envoyProxyServer) patchDeploymentConfig(dcName, namespace, envoyNodeID string, svcProxyPort int, client k8sclient.Client) (integreatlyv1alpha1.StatusPhase, error) {
 
 	dc, phase, err := getDeploymentConfig(envoyProxy.ctx, envoyProxy.client, dcName, namespace)
 	if err != nil {
@@ -79,32 +79,43 @@ func (envoyProxy *envoyProxyServer) patchDeploymentConfig(dcName, namespace, env
 		return phase, nil
 	}
 
-	if dc.Spec.Template.Labels == nil {
-		dc.Spec.Template.SetLabels(make(map[string]string))
-	}
-	if dc.Spec.Template.Annotations == nil {
-		dc.Spec.Template.SetAnnotations(make(map[string]string))
-	}
+	_, err = controllerutil.CreateOrUpdate(context.TODO(), client, dc, func() error {
+		if dc.Spec.Template.ObjectMeta.Annotations == nil {
+			dc.Spec.Template.ObjectMeta.Annotations = map[string]string{}
+		}
 
-	envoyPort := fmt.Sprintf("envoy-https:%s", strconv.Itoa(svcProxyPort))
+		if dc.Spec.Template.Labels == nil {
+			dc.Spec.Template.Labels = map[string]string{}
+		}
 
-	envoyProxy.log.Infof(
-		"adding MARIN3R annotations and labels: ", l.Fields{
-			"marin3r.3scale.net/node-id":           envoyNodeID,
-			"marin3r.3scale.net/ports":             envoyPort,
-			"marin3r.3scale.net/envoy-image":       EnvoyImage,
-			"marin3r.3scale.net/status":            "enabled",
-			"marin3r.3scale.net/envoy-api-version": EnvoyAPIVersion,
-		})
+		if dc.Spec.Template.Annotations == nil {
+			dc.Spec.Template.Annotations = map[string]string{}
+		}
 
-	dc.Spec.Template.Labels["marin3r.3scale.net/status"] = "enabled"
-	dc.Spec.Template.Annotations["marin3r.3scale.net/node-id"] = envoyNodeID
-	dc.Spec.Template.Annotations["marin3r.3scale.net/ports"] = envoyPort
-	dc.Spec.Template.Annotations["marin3r.3scale.net/envoy-api-version"] = EnvoyAPIVersion
-	dc.Spec.Template.Annotations["marin3r.3scale.net/envoy-image"] = EnvoyImage
+		envoyPort := fmt.Sprintf("envoy-https:%s", strconv.Itoa(svcProxyPort))
 
-	if err := envoyProxy.client.Update(envoyProxy.ctx, dc); err != nil {
-		return integreatlyv1alpha1.PhaseFailed, fmt.Errorf("failed to apply MARIN3R labels to %s deploymentconfig: %v", dcName, err)
+		envoyProxy.log.Infof(
+			"adding MARIN3R annotations and labels: ", l.Fields{
+				"marin3r.3scale.net/node-id":           envoyNodeID,
+				"marin3r.3scale.net/ports":             envoyPort,
+				"marin3r.3scale.net/envoy-image":       EnvoyImage,
+				"marin3r.3scale.net/status":            "enabled",
+				"marin3r.3scale.net/envoy-api-version": EnvoyAPIVersion,
+			})
+
+		dc.Spec.Template.Labels["marin3r.3scale.net/status"] = "enabled"
+		dc.Spec.Template.Annotations["marin3r.3scale.net/node-id"] = envoyNodeID
+		dc.Spec.Template.Annotations["marin3r.3scale.net/ports"] = envoyPort
+		dc.Spec.Template.Annotations["marin3r.3scale.net/envoy-api-version"] = EnvoyAPIVersion
+		dc.Spec.Template.Annotations["marin3r.3scale.net/envoy-image"] = EnvoyImage
+		dc.Spec.Template.ObjectMeta.Annotations["marin3r.3scale.net/resources.requests.cpu"] = "190m"
+		dc.Spec.Template.ObjectMeta.Annotations["marin3r.3scale.net/resources.requests.memory"] = "90Mi"
+		dc.Spec.Template.ObjectMeta.Annotations["marin3r.3scale.net/resources.limits.cpu"] = "210m"
+		dc.Spec.Template.ObjectMeta.Annotations["marin3r.3scale.net/resources.limits.memory"] = "100Mi"
+		return nil
+	})
+	if err != nil {
+		return integreatlyv1alpha1.PhaseFailed, fmt.Errorf("failed to add annotations %s: %v", dc.Name, err)
 	}
 	return integreatlyv1alpha1.PhaseCompleted, nil
 }
